@@ -150,7 +150,7 @@ Answer helpfully and concisely. Always include:
 
 Use Slack markdown: *bold* for key numbers/labels, _italic_ for dates. Keep it scannable."""
 
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}'
+    url = f'https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}'
     body = {
         'contents': [{'parts': [{'text': prompt}]}],
         'generationConfig': {'maxOutputTokens': 1024},
