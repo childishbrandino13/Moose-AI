@@ -10,6 +10,7 @@ app = Flask(__name__)
 # ── Config from environment variables (set in Vercel dashboard) ──
 SLACK_BOT_TOKEN  = os.environ.get('SLACK_BOT_TOKEN')
 GEMINI_API_KEY   = os.environ.get('GEMINI_API_KEY')
+GEMINI_MODEL     = os.environ.get('GEMINI_MODEL', 'gemini-1.5-flash')
 SHEETS_API_KEY   = os.environ.get('SHEETS_API_KEY')   # Google API key with Sheets enabled
 SPREADSHEET_ID   = os.environ.get('SPREADSHEET_ID')
 SHEET_NAME       = os.environ.get('SHEET_NAME', 'Sheet1')
@@ -23,7 +24,7 @@ COL_PLAYER_CODE = 1   # B
 COL_DATE        = 2   # C
 COL_TYPE        = 3   # D
 
-NEGATIVE_TYPES  = ['negative', 'bug', 'issue']
+NEGATIVE_TYPES  = ['negative', 'bug', 'complaint', 'issue']
 
 
 @app.route('/', methods=['GET'])
@@ -149,7 +150,7 @@ Answer helpfully and concisely. Always include:
 
 Use Slack markdown: *bold* for key numbers/labels, _italic_ for dates. Keep it scannable."""
 
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}'
     body = {
         'contents': [{'parts': [{'text': prompt}]}],
         'generationConfig': {'maxOutputTokens': 1024},
