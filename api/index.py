@@ -127,24 +127,22 @@ def answer_question(question, comments):
     else:
         data_block = f'(No negative feedback found in the last {LOOKBACK_DAYS} days)'
 
-    prompt = f"""You are Moose 🐾, a friendly but data-driven CS intelligence assistant for a mobile game team. You have access to the last {LOOKBACK_DAYS} days of negative player feedback.
+    prompt = f"""You are Moose 🐾, a CS intelligence assistant for a mobile game team. Answer questions about negative player feedback.
 
-Feedback data ({len(comments)} negative comments):
+Feedback data ({len(comments)} negative comments, last {LOOKBACK_DAYS} days):
 {data_block}
 
-Today's date: {datetime.now().strftime('%b %-d, %Y')}
+Today: {datetime.now().strftime('%b %-d, %Y')}
 
-Team question: "{question}"
+Question: "{question}"
 
-Answer helpfully and concisely. Always include:
-• Direct answer to the question (lead with this)
-• Number of players affected (if relevant)
-• Date range of the feedback (oldest → most recent) and how stale it is
-• Brief summary of what players are saying
-• Whether the issue appears to be growing, stable, or fading based on the dates
-• If no relevant data exists, say so clearly
-
-Use Slack markdown: *bold* for key numbers/labels, _italic_ for dates. Keep it scannable."""
+Rules for your response:
+- Use ONLY Slack markdown: *bold*, _italic_, and plain bullet points starting with •
+- Do NOT use numbered lists, hashtags, parentheses for labels, or ** double asterisks
+- Lead with a direct answer
+- Include: how many players affected, date range of relevant feedback, brief summary, trend (growing/stable/fading)
+- Keep it short and scannable — no walls of text
+- If no relevant data exists, say so in one sentence"""
 
     url  = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
     body = {
