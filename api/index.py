@@ -53,8 +53,8 @@ def slack_handler():
     channel   = event.get('channel')
     thread_ts = event.get('thread_ts') or event.get('ts')
 
-    # Load comments from KV cache
-    comments = kv_get()
+    # Load comments from KV cache (most recent 50 only for speed)
+    comments = kv_get()[:50]
 
     # Ask Gemini
     answer = answer_question(question, comments)
