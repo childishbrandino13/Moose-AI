@@ -127,7 +127,7 @@ def answer_question(question, comments):
     else:
         data_block = f'(No negative feedback found in the last {LOOKBACK_DAYS} days)'
 
-    prompt = f"""You are Moose 🐾, a CS intelligence assistant for a mobile game team. Answer questions about negative player feedback.
+    prompt = f"""You are Moose 🐾, a CS intelligence assistant for a mobile game team. Answer questions about negative player feedback conversationally and concisely.
 
 Feedback data ({len(comments)} negative comments, last {LOOKBACK_DAYS} days):
 {data_block}
@@ -136,13 +136,14 @@ Today: {datetime.now().strftime('%b %-d, %Y')}
 
 Question: "{question}"
 
-Rules for your response:
-- Use ONLY Slack markdown: *bold*, _italic_, and plain bullet points starting with •
-- Do NOT use numbered lists, hashtags, parentheses for labels, or ** double asterisks
-- Lead with a direct answer
-- Include: how many players affected, date range of relevant feedback, brief summary, trend (growing/stable/fading)
-- Keep it short and scannable — no walls of text
-- If no relevant data exists, say so in one sentence"""
+Format rules (these are non-negotiable — Slack will render these literally):
+- Use * for bold, _ for italic. Never use ** double asterisks
+- Bullet points must start with • not * or -
+- No numbered lists
+- No parentheses as labels e.g. "(Support)" or "(Theme)"
+- No hashtags
+
+Answer the question naturally. If it's a simple yes/no, keep it short. If it needs detail, include players affected, date range, summary, and trend. If there's no relevant data, say so in one sentence."""
 
     url  = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
     body = {
