@@ -154,7 +154,7 @@ Use Slack markdown: *bold* for key numbers/labels, _italic_ for dates. Keep it s
     res  = requests.post(
         url, json=body,
         headers={'X-goog-api-key': GEMINI_API_KEY},
-        timeout=30,
+        timeout=55,
     )
     data = res.json()
 
