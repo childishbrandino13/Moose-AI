@@ -11,21 +11,18 @@ app = Flask(__name__)
 SLACK_BOT_TOKEN  = os.environ.get('SLACK_BOT_TOKEN')
 GEMINI_API_KEY   = os.environ.get('GEMINI_API_KEY')
 GEMINI_MODEL     = os.environ.get('GEMINI_MODEL', 'gemini-flash-latest')
-SHEETS_API_KEY   = os.environ.get('SHEETS_API_KEY')   # Google API key with Sheets enabled
-SPREADSHEET_ID   = os.environ.get('SPREADSHEET_ID')
-SHEET_NAME       = os.environ.get('SHEET_NAME', 'Sheet1')
 MOOSE_NAME       = os.environ.get('MOOSE_NAME', 'Moose')
 MOOSE_ICON_URL   = os.environ.get('MOOSE_ICON_URL', '')
 LOOKBACK_DAYS    = int(os.environ.get('LOOKBACK_DAYS', '90'))
+CACHE_SECRET     = os.environ.get('CACHE_SECRET')        # shared secret between Apps Script and Vercel
 
-# Column positions (0-indexed)
-COL_COMMENT     = 0   # A
-COL_PLAYER_CODE = 1   # B
-COL_DATE        = 2   # C
-COL_TYPE        = 3   # D
+# Vercel KV (auto-populated when you add a KV store in Vercel dashboard)
+KV_REST_API_URL   = os.environ.get('KV_REST_API_URL')
+KV_REST_API_TOKEN = os.environ.get('KV_REST_API_TOKEN')
+KV_KEY            = 'moose_comments'
 
-NEGATIVE_TYPES  = ['negative', 'bug', 'complaint', 'issue']
 
+# ── Routes ────────────────────────────────────────────────────
 
 @app.route('/', methods=['GET'])
 def health():
@@ -33,14 +30,17 @@ def health():
 
 
 @app.route('/', methods=['POST'])
-def handler():
+def slack_handler():
     payload = request.get_json(force=True, silent=True) or {}
 
-    # ── Slack URL verification ──
+    # Slack URL verification
     if payload.get('type') == 'url_verification':
         return jsonify({'challenge': payload.get('challenge')})
 
-    # ── App mention event ──
+    # Ignore retries (Slack retries if we're slow — avoid duplicate replies)
+    if request.headers.get('X-Slack-Retry-Num'):
+        return jsonify({'ok': True})
+
     event = payload.get('event', {})
     if event.get('type') != 'app_mention' or event.get('bot_id'):
         return jsonify({'ok': True})
@@ -49,91 +49,87 @@ def handler():
     if not text:
         return jsonify({'ok': True})
 
-    # Strip the @Moose mention
-    question = re.sub(r'<@[A-Z0-9]+>\s*', '', text).strip()
-    channel  = event.get('channel')
+    question  = re.sub(r'<@[A-Z0-9]+>\s*', '', text).strip()
+    channel   = event.get('channel')
     thread_ts = event.get('thread_ts') or event.get('ts')
 
-    # Read sheet data
-    rows = get_negative_comments()
+    # Load comments from KV cache
+    comments = kv_get()
 
     # Ask Gemini
-    answer = answer_question(question, rows)
+    answer = answer_question(question, comments)
 
-    # Reply in thread
+    # Reply in Slack thread
     post_slack_reply(channel, thread_ts, answer)
 
     return jsonify({'ok': True})
 
 
-# ── Google Sheets ──────────────────────────────────────────────
+@app.route('/cache', methods=['POST'])
+def cache_handler():
+    """
+    Receives comment data pushed from Apps Script.
+    Protected by a shared secret token.
+    """
+    auth = request.headers.get('X-Cache-Secret')
+    if auth != CACHE_SECRET:
+        return jsonify({'error': 'unauthorized'}), 401
 
-def get_negative_comments():
-    url = (
-        f'https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}'
-        f'/values/{SHEET_NAME}!A:D?key={SHEETS_API_KEY}'
+    data = request.get_json(force=True, silent=True)
+    if not data or 'comments' not in data:
+        return jsonify({'error': 'missing comments'}), 400
+
+    kv_set(data['comments'])
+    return jsonify({'ok': True, 'count': len(data['comments'])})
+
+
+# ── Vercel KV ─────────────────────────────────────────────────
+
+def kv_set(comments):
+    """Save comments array to KV store."""
+    value = json.dumps(comments)
+    requests.post(
+        f'{KV_REST_API_URL}/set/{KV_KEY}',
+        headers={
+            'Authorization': f'Bearer {KV_REST_API_TOKEN}',
+            'Content-Type':  'application/json',
+        },
+        data=value,
+        timeout=10,
     )
-    res = requests.get(url, timeout=10)
+
+
+def kv_get():
+    """Read comments array from KV store."""
+    res = requests.get(
+        f'{KV_REST_API_URL}/get/{KV_KEY}',
+        headers={'Authorization': f'Bearer {KV_REST_API_TOKEN}'},
+        timeout=10,
+    )
     data = res.json()
-    rows_raw = data.get('values', [])
-    if len(rows_raw) < 2:
+    result = data.get('result')
+    if not result:
         return []
-
-    cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-    results = []
-
-    for row in rows_raw[1:]:  # skip header
-        if len(row) < 4:
-            continue
-        comment     = row[COL_COMMENT].strip()
-        player_code = row[COL_PLAYER_CODE].strip() if len(row) > COL_PLAYER_CODE else 'unknown'
-        raw_date    = row[COL_DATE].strip()
-        type_val    = row[COL_TYPE].strip()
-
-        if not comment or not is_negative(type_val):
-            continue
-
-        try:
-            date = datetime.strptime(raw_date, '%m/%d/%Y')
-        except ValueError:
-            try:
-                date = datetime.fromisoformat(raw_date)
-            except Exception:
-                continue
-
-        if date < cutoff:
-            continue
-
-        results.append({
-            'comment':     comment,
-            'player_code': player_code,
-            'date':        date.strftime('%b %-d, %Y'),
-            'raw_date':    date,
-        })
-
-    results.sort(key=lambda x: x['raw_date'], reverse=True)
-    return results
-
-
-def is_negative(type_val):
-    lower = type_val.lower()
-    return any(t in lower for t in NEGATIVE_TYPES)
+    try:
+        return json.loads(result)
+    except Exception:
+        return []
 
 
 # ── Gemini ────────────────────────────────────────────────────
 
-def answer_question(question, rows):
-    if rows:
+def answer_question(question, comments):
+    if comments:
         data_block = '\n'.join(
-            f"{i+1}. [{r['date']}] [Player: {r['player_code']}] {r['comment']}"
-            for i, r in enumerate(rows)
+            f"{i+1}. [{c.get('date','?')}] [Player: {c.get('player_code','?')}] {c.get('comment','')}"
+            for i, c in enumerate(comments)
         )
     else:
         data_block = f'(No negative feedback found in the last {LOOKBACK_DAYS} days)'
 
     prompt = f"""You are Moose 🐾, a friendly but data-driven CS intelligence assistant for a mobile game team. You have access to the last {LOOKBACK_DAYS} days of negative player feedback.
 
-Feedback data ({len(rows)} negative comments):
+Feedback data ({len(comments)} negative comments):
 {data_block}
 
 Today's date: {datetime.now().strftime('%b %-d, %Y')}
@@ -150,12 +146,16 @@ Answer helpfully and concisely. Always include:
 
 Use Slack markdown: *bold* for key numbers/labels, _italic_ for dates. Keep it scannable."""
 
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+    url  = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
     body = {
         'contents': [{'parts': [{'text': prompt}]}],
         'generationConfig': {'maxOutputTokens': 1024},
     }
-    res  = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=30)
+    res  = requests.post(
+        url, json=body,
+        headers={'X-goog-api-key': GEMINI_API_KEY},
+        timeout=30,
+    )
     data = res.json()
 
     if 'error' in data:
