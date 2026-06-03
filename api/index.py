@@ -52,12 +52,16 @@ def slack_handler():
     question  = re.sub(r'<@[A-Z0-9]+>\s*', '', text).strip()
     channel   = event.get('channel')
     thread_ts = event.get('thread_ts') or event.get('ts')
+    is_reply  = event.get('thread_ts') and event.get('thread_ts') != event.get('ts')
 
     # Load comments from KV cache (most recent 50 only for speed)
     comments = kv_get()[:50]
 
+    # Fetch thread history for context if this is a follow-up
+    thread_history = get_thread_history(channel, thread_ts) if is_reply else []
+
     # Ask Gemini
-    answer = answer_question(question, comments)
+    answer = answer_question(question, comments, thread_history)
 
     # Reply in Slack thread
     post_slack_reply(channel, thread_ts, answer)
@@ -118,7 +122,28 @@ def kv_get():
 
 # ── Gemini ────────────────────────────────────────────────────
 
-def answer_question(question, comments):
+def get_thread_history(channel, thread_ts):
+    """Fetch previous messages in a Slack thread for conversation context."""
+    res = requests.get(
+        'https://slack.com/api/conversations.replies',
+        headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+        params={'channel': channel, 'ts': thread_ts, 'limit': 20},
+        timeout=10,
+    )
+    data = res.json()
+    messages = data.get('messages', [])
+    history = []
+    for msg in messages:
+        # Skip the bot_id check differently — include both user and bot messages
+        text = re.sub(r'<@[A-Z0-9]+>\s*', '', msg.get('text', '')).strip()
+        if not text:
+            continue
+        role = 'model' if msg.get('bot_id') else 'user'
+        history.append({'role': role, 'parts': [{'text': text}]})
+    return history
+
+
+def answer_question(question, comments, thread_history=None):
     if comments:
         data_block = '\n'.join(
             f"{i+1}. [{c.get('date','?')}] [Support Code: {c.get('playerCode') or c.get('player_code','?')}] {c.get('comment','')}"
@@ -148,9 +173,21 @@ Format rules:
 - Keep the total response under 800 characters
 - If there's no relevant data, say so in one sentence"""
 
-    url  = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+
+    # Build conversation: system prompt first, then thread history, then current question
+    contents = [{'role': 'user', 'parts': [{'text': prompt}]},
+                {'role': 'model', 'parts': [{'text': 'Understood. I will answer questions about this feedback data accurately and concisely.'}]}]
+
+    if thread_history:
+        # Append prior thread turns (skip the first system exchange)
+        contents.extend(thread_history[1:])  # skip the original question already in prompt
+
+    # Add current question as final user turn
+    contents.append({'role': 'user', 'parts': [{'text': question}]})
+
     body = {
-        'contents': [{'parts': [{'text': prompt}]}],
+        'contents': contents,
         'generationConfig': {'maxOutputTokens': 2048},
     }
     res  = requests.post(
