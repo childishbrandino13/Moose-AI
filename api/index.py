@@ -141,8 +141,10 @@ Format rules:
 - Use * for bold, _ for italic. Never use ** double asterisks
 - Bullet points must start with • not * or -
 - No numbered lists, no hashtags, no parentheses as labels
-- Always include: what the issue is, how many players, date range, what players are saying, and whether it's getting better or worse
-- Never cut the answer short — give a complete response even if it's a few sentences longer
+- Always include: what the issue is, how many players, date range, and what players are saying
+- Only report what the data actually shows — do not infer, speculate, or extrapolate beyond what players explicitly wrote
+- If only 1 player reported something, say so clearly and do not imply it's a wider trend
+- Keep the total response under 800 characters
 - If there's no relevant data, say so in one sentence"""
 
     url  = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
@@ -166,15 +168,18 @@ Format rules:
 # ── Slack ─────────────────────────────────────────────────────
 
 def post_slack_reply(channel, thread_ts, text):
-    requests.post(
-        'https://slack.com/api/chat.postMessage',
-        headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
-        json={
-            'channel':   channel,
-            'thread_ts': thread_ts,
-            'text':      text,
-            'username':  MOOSE_NAME,
-            'icon_url':  MOOSE_ICON_URL,
-        },
-        timeout=10,
-    )
+    # Split into chunks of 3800 chars to stay under Slack's 4000 char limit
+    chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
+    for chunk in chunks:
+        requests.post(
+            'https://slack.com/api/chat.postMessage',
+            headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+            json={
+                'channel':   channel,
+                'thread_ts': thread_ts,
+                'text':      chunk,
+                'username':  MOOSE_NAME,
+                'icon_url':  MOOSE_ICON_URL,
+            },
+            timeout=10,
+        )
