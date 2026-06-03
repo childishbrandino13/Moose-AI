@@ -121,7 +121,7 @@ def kv_get():
 def answer_question(question, comments):
     if comments:
         data_block = '\n'.join(
-            f"{i+1}. [{c.get('date','?')}] [Player: {c.get('player_code','?')}] {c.get('comment','')}"
+            f"{i+1}. [{c.get('date','?')}] [Support Code: {c.get('playerCode') or c.get('player_code','?')}] {c.get('comment','')}"
             for i, c in enumerate(comments)
         )
     else:
@@ -130,6 +130,7 @@ def answer_question(question, comments):
     prompt = f"""You are a CS intelligence assistant for a mobile game team. Answer questions about negative player feedback directly and thoroughly.
 
 Feedback data ({len(comments)} negative comments, last {LOOKBACK_DAYS} days):
+Each entry format: [date] [Support Code: unique player identifier used by CS team] comment
 {data_block}
 
 Today: {datetime.now().strftime('%b %-d, %Y')}
