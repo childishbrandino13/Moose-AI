@@ -80,12 +80,13 @@ def health():
 
 @app.route('/', methods=['POST'])
 def slack_handler():
-    """Handles conversational workspace user mentions."""
+    """Handles conversational workspace user mentions with immediate loading state feedback."""
     payload = request.get_json(force=True, silent=True) or {}
 
     if payload.get('type') == 'url_verification':
         return jsonify({'challenge': payload.get('challenge')})
 
+    # CRITICAL: Bypasses Slack retry spam instantly while Moose is running the Gemini process
     if request.headers.get('X-Slack-Retry-Num'):
         return jsonify({'ok': True})
 
@@ -101,25 +102,56 @@ def slack_handler():
     channel   = event.get('channel')
     thread_ts = event.get('thread_ts') or event.get('ts')
 
-    # Guard execution safety limit caps
+    # STEP 1: Post an immediate placeholder message to let the team know Moose is digging
+    # This responds to Slack's webhook within milliseconds, completely bypassing the 3-second timeout rule
+    loading_res = requests.post(
+        'https://slack.com/api/chat.postMessage',
+        headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+        json={
+            'channel': channel,
+            'thread_ts': thread_ts,
+            'text': ':cat-jam-party: _Moose is scanning database patterns..._'
+        },
+        timeout=10
+    ).json()
+
+    # Capture the unique timestamp of the placeholder message so we can overwrite it later
+    loading_message_ts = loading_res.get('message', {}).get('ts')
+
+    # STEP 2: Safety Guardrail evaluation
     if not check_gemini_rate_limit():
-        post_slack_reply(channel, thread_ts, "⚠️ System rate limiter active. Ask again in an hour.")
+        if loading_message_ts:
+            update_slack_message(channel, loading_message_ts, "⚠️ System rate limiter active. Ask again in an hour.")
         return jsonify({'ok': True})
 
-    # Execute search against Upstash Index
-    question_vector = get_embedding(question, is_query=True)
-    search_results = vector_index.query(vector=question_vector, top_k=25, include_metadata=True)
+    try:
+        # STEP 3: Handle the vector database query and get context data
+        question_vector = get_embedding(question, is_query=True)
+        search_results = vector_index.query(vector=question_vector, top_k=25, include_metadata=True)
 
-    comments = []
-    for res in search_results:
-        comments.append({
-            'date': res.metadata.get('date'),
-            'playerCode': res.metadata.get('playerCode'),
-            'comment': res.metadata.get('comment')
-        })
+        comments = []
+        for res in search_results:
+            comments.append({
+                'date': res.metadata.get('date'),
+                'playerCode': res.metadata.get('playerCode'),
+                'comment': res.metadata.get('comment')
+            })
 
-    answer = answer_question(question, comments)
-    post_slack_reply(channel, thread_ts, answer)
+        # STEP 4: Call Gemini 2.5 Flash to synthesize the final answer
+        answer = answer_question(question, comments)
+
+        # STEP 5: Overwrite the placeholder emoji message with the final response text
+        if loading_message_ts:
+            update_slack_message(channel, loading_message_ts, answer)
+        else:
+            # Fallback if the original post tracking initialization somehow dropped
+            post_slack_reply(channel, thread_ts, answer)
+
+    except Exception as e:
+        print(f"Error handling query chain processing: {str(e)}")
+        if loading_message_ts:
+            update_slack_message(channel, loading_message_ts, f"⚠️ Sorry, I encountered an internal processing error: {str(e)}")
+
     return jsonify({'ok': True})
 
 
@@ -243,5 +275,23 @@ def post_slack_reply(channel, thread_ts, text):
         'https://slack.com/api/chat.postMessage',
         headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
         json={'channel': channel, 'thread_ts': thread_ts, 'text': text},
+        timeout=10
+    )
+    
+def update_slack_message(channel, message_ts, text):
+    """
+    Overwrites an existing Slack message text using its transaction timestamp id.
+    """
+    requests.post(
+        'https://slack.com/api/chat.update',
+        headers={
+            'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
+            'Content-Type': 'application/json; charset=utf-8'
+        },
+        json={
+            'channel': channel,
+            'ts': message_ts,
+            'text': text
+        },
         timeout=10
     )
