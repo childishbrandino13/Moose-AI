@@ -22,11 +22,15 @@ vector_index       = Index(url=VECTOR_URL, token=VECTOR_TOKEN)
 
 # ── Helper: Generate Gemini Embeddings ────────────────────────
 def get_embedding(text):
-    """Generates numerical vectors for semantic search using text-embedding-004."""
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent'
+    # Using the universally supported gemini-embedding-001 endpoint
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent'
     body = {
-        "model": "models/text-embedding-004",
-        "content": {"parts": [{"text": text}]}
+        "model": "models/gemini-embedding-001",
+        "content": {"parts": [{"text": text}]},
+        # Safety fit: Locks the new model into your 768 Upstash dimension size
+        "embedContentConfig": {
+            "output_dimensionality": 768
+        }
     }
     res = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=15)
     return res.json()['embedding']['values']
