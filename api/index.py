@@ -2,34 +2,63 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import re
+import time
 from datetime import datetime
-from upstash_vector import Index # Run: pip install upstash-vector
+from upstash_vector import Index # Required: pip install upstash-vector
 
 app = Flask(__name__)
 
-# ── Config from environment variables ──
-SLACK_BOT_TOKEN    = os.environ.get('SLACK_BOT_TOKEN')
-GEMINI_API_KEY     = os.environ.get('GEMINI_API_KEY')
-GEMINI_MODEL       = os.environ.get('GEMINI_MODEL', 'gemini-1.5-flash')
-SLACK_ALERT_CHANNEL= os.environ.get('SLACK_ALERT_CHANNEL', 'C0B8581VDU')
-CACHE_SECRET       = os.environ.get('CACHE_SECRET')
-ALERT_THRESHOLD    = int(os.environ.get('ALERT_THRESHOLD', '3'))
+# ── Config from Environment Variables ──
+SLACK_BOT_TOKEN     = os.environ.get('SLACK_BOT_TOKEN')
+GEMINI_API_KEY      = os.environ.get('GEMINI_API_KEY')
+GEMINI_MODEL        = os.environ.get('GEMINI_MODEL', 'gemini-1.5-flash')
+SLACK_ALERT_CHANNEL = os.environ.get('SLACK_ALERT_CHANNEL', 'C0B8581VDU1')
+CACHE_SECRET        = os.environ.get('CACHE_SECRET')
+ALERT_THRESHOLD     = int(os.environ.get('ALERT_THRESHOLD', '3'))
 
-# Upstash Vector Configuration
-VECTOR_URL         = os.environ.get('UPSTASH_VECTOR_REST_URL')
-VECTOR_TOKEN       = os.environ.get('UPSTASH_VECTOR_REST_TOKEN')
-vector_index       = Index(url=VECTOR_URL, token=VECTOR_TOKEN)
+# Upstash Vector Dashboard Marketplace Configuration
+VECTOR_URL          = os.environ.get('UPSTASH_VECTOR_REST_URL')
+VECTOR_TOKEN        = os.environ.get('UPSTASH_VECTOR_REST_TOKEN')
+vector_index        = Index(url=VECTOR_URL, token=VECTOR_TOKEN)
 
-# ── Helper: Generate Gemini Embeddings ────────────────────────
-def get_embedding(text):
-    # Using the universally supported gemini-embedding-001 endpoint
+# ── Safety Guardrails State ──
+RATE_LIMIT_WINDOW = 3600             # 1 hour tracking frame
+MAX_GEMINI_CALLS_PER_HOUR = 100      # Free-tier enforcement threshold
+ALERT_COOLDOWN_WINDOW = 900          # 15 minutes of quiet time between Slack pings
+
+gemini_call_timestamps = []
+last_alert_time = 0
+
+# ── System Safety Logic ──
+def check_gemini_rate_limit():
+    """Safety Guardrail: Drops processing if rapid looping risks billing."""
+    global gemini_call_timestamps
+    now = time.time()
+    
+    # Prune elements older than 1 hour
+    gemini_call_timestamps = [t for t in gemini_call_timestamps if now - t < RATE_LIMIT_WINDOW]
+    
+    if len(gemini_call_timestamps) >= MAX_GEMINI_CALLS_PER_HOUR:
+        print("⚠️ SAFETY GUARDRAIL: Gemini API limit hit. Pausing processing to prevent charge.")
+        return False
+        
+    gemini_call_timestamps.append(now)
+    return True
+
+# ── Google Gemini Embeddings Call ──
+def get_embedding(text, is_query=False):
+    """Generates numerical vectors for Upstash mapping using gemini-embedding-001."""
     url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent'
+    
+    # Optimization: Use targeted retrieval modes to increase semantic match precision
+    task_type = "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT"
+    
     body = {
         "model": "models/gemini-embedding-001",
         "content": {"parts": [{"text": text}]},
-        # Safety fit: Locks the new model into your 768 Upstash dimension size
+        "taskType": task_type,
         "embedContentConfig": {
-            "output_dimensionality": 768
+            "output_dimensionality": 768  # Locks footprint size to your Upstash index layout
         }
     }
     res = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=15)
@@ -37,8 +66,13 @@ def get_embedding(text):
 
 # ── Routes ────────────────────────────────────────────────────
 
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({'status': 'Moose is alive 🐾'})
+
 @app.route('/', methods=['POST'])
 def slack_handler():
+    """Handles conversational workspace user mentions."""
     payload = request.get_json(force=True, silent=True) or {}
 
     if payload.get('type') == 'url_verification':
@@ -59,17 +93,15 @@ def slack_handler():
     channel   = event.get('channel')
     thread_ts = event.get('thread_ts') or event.get('ts')
 
-    # Get Question Embedding Vector
-    question_vector = get_embedding(question)
+    # Guard execution safety limit caps
+    if not check_gemini_rate_limit():
+        post_slack_reply(channel, thread_ts, "⚠️ System rate limiter active. Ask again in an hour.")
+        return jsonify({'ok': True})
 
-    # Search Vector DB for top 25 contextually matching complaints
-    search_results = vector_index.query(
-        vector=question_vector,
-        top_k=25,
-        include_metadata=True
-    )
+    # Execute search against Upstash Index
+    question_vector = get_embedding(question, is_query=True)
+    search_results = vector_index.query(vector=question_vector, top_k=25, include_metadata=True)
 
-    # Map database matches into a clean string context block for Gemini
     comments = []
     for res in search_results:
         comments.append({
@@ -78,62 +110,60 @@ def slack_handler():
             'comment': res.metadata.get('comment')
         })
 
-    # Ask Gemini based on targeted vector results
     answer = answer_question(question, comments)
-
-    # Reply directly in the Slack thread
     post_slack_reply(channel, thread_ts, answer)
     return jsonify({'ok': True})
 
 
 @app.route('/cache', methods=['POST'])
 def cache_handler():
-    """
-    Receives single new comment row data pushed from Apps Script.
-    Analyzes theme clustering patterns via vector search.
-    """
+    """Receives newly tracked tickets to index patterns and handle alerts."""
+    global last_alert_time
+    
     auth = request.headers.get('X-Cache-Secret')
     if auth != CACHE_SECRET:
         return jsonify({'error': 'unauthorized'}), 401
 
-    data = request.get_json(force=True, silent=True)
+    data = request.get_json(force=True, silent=True) or {}
     if not data or 'comment' not in data:
         return jsonify({'error': 'missing comment data'}), 400
+
+    if not check_gemini_rate_limit():
+        return jsonify({'error': 'Rate-limit buffer maxed out'}), 429
 
     comment_text = data['comment']
     player_code  = data.get('playerCode', 'unknown')
     comment_date = data.get('date', datetime.now().strftime('%b %d, %Y'))
 
-    # Generate vector embedding for incoming single comment
-    comment_vector = get_embedding(comment_text)
+    # Generate item vector
+    comment_vector = get_embedding(comment_text, is_query=False)
 
-    # Query for structurally identical historical records (Threshold score 0.82)
-    matches = vector_index.query(
-        vector=comment_vector,
-        top_k=10,
-        include_metadata=True
-    )
-
-    theme_matches = [m for m in matches if m.score >= 0.82]
+    # Search for historical contextual matches
+    matches = vector_index.query(vector=comment_vector, top_k=10, include_metadata=True)
+    theme_matches = [m for m in matches if m.score >= 0.82] # 82%+ semantic pattern match
     
-    # Save new record to Upstash Vector Index
+    # Save standard record entry directly inside Upstash Vector
     record_id = f"ticket_{datetime.now().timestamp()}"
     vector_index.upsert(
-        vectors=[
-            (record_id, comment_vector, {
-                "comment": comment_text,
-                "playerCode": player_code,
-                "date": comment_date
-            })
-        ]
+        vectors=[(record_id, comment_vector, {
+            "comment": comment_text,
+            "playerCode": player_code,
+            "date": comment_date
+        })]
     )
 
-    # If matching theme patterns cross the tracking threshold, flag it in Slack
+    # Evaluate dynamic threshold logic paired with spam cooldown protections
+    now = time.time()
     if len(theme_matches) + 1 >= ALERT_THRESHOLD:
-        trigger_slack_alert(comment_text, len(theme_matches) + 1, player_code)
+        if now - last_alert_time > ALERT_COOLDOWN_WINDOW:
+            trigger_slack_alert(comment_text, len(theme_matches) + 1, player_code)
+            last_alert_time = now
+        else:
+            print("ℹ️ Theme pattern threshold crossed, but system is inside alert spam cooldown window.")
 
     return jsonify({'ok': True, 'status': 'processed'})
 
+# ── Synthesis & Output Format Engines ─────────────────────────
 
 def answer_question(question, comments):
     if comments:
@@ -142,11 +172,11 @@ def answer_question(question, comments):
             for i, c in enumerate(comments)
         )
     else:
-        data_block = '(No relevant historical customer complaints found in database matches)'
+        data_block = '(No matching context references found across database profiles)'
 
     prompt = f"""You are a CS intelligence assistant for a mobile sweeps app game team. Answer questions about negative player feedback directly and thoroughly.
 
-Relevant historical context retrieved from database vector search:
+Relevant context vectors extracted from database matching:
 {data_block}
 
 Today: {datetime.now().strftime('%b %d, %Y')}
@@ -156,7 +186,7 @@ Format rules:
 - Start your answer immediately — no greetings or preambles
 - Use * for bold, _ for italic.
 - Bullet points must start with •
-- Keep total response under 800 characters."""
+- Limit output context completely to fit safely inside 800 characters max."""
 
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
     body = {
