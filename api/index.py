@@ -47,22 +47,30 @@ def check_gemini_rate_limit():
 
 # ── Google Gemini Embeddings Call ──
 def get_embedding(text, is_query=False):
-    """Generates numerical vectors for Upstash mapping using gemini-embedding-001."""
+    """
+    Generates numerical vectors using the active gemini-embedding-001 model.
+    Correctly formats MRL parameter constraints to clip the size down to 768.
+    """
     url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent'
     
-    # Optimization: Use targeted retrieval modes to increase semantic match precision
+    # Set the correct task type based on workflow context
     task_type = "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT"
     
     body = {
         "model": "models/gemini-embedding-001",
         "content": {"parts": [{"text": text}]},
         "taskType": task_type,
-        "embedContentConfig": {
-            "output_dimensionality": 768  # Locks footprint size to your Upstash index layout
-        }
+        # THIS IS THE FIXED PAYLOAD FORMAT FOR MODERN GEMINI MODELS:
+        "outputDimensionality": 768
     }
+    
     res = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=15)
-    return res.json()['embedding']['values']
+    res_json = res.json()
+    
+    if 'error' in res_json:
+        raise Exception(f"Gemini Embedding Error: {res_json['error'].get('message')}")
+        
+    return res_json['embedding']['values']
 
 # ── Routes ────────────────────────────────────────────────────
 
