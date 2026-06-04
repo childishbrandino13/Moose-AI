@@ -197,13 +197,31 @@ Format rules:
 - Limit output context completely to fit safely inside 800 characters max."""
 
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+    
     body = {
         'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
         'generationConfig': {'maxOutputTokens': 1024},
+        # Safety Settings: Prevents Gemini from shutting down when analyzing angry or flagged review text
+        'safetySettings': [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
     }
+    
     res = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=45)
-    return res.json()['candidates'][0]['content']['parts'][0]['text']
+    res_json = res.json()
 
+    if 'error' in res_json:
+        return f"⚠️ Gemini API Error: {res_json['error'].get('message', 'Unknown error')}"
+        
+    if 'candidates' not in res_json or not res_json['candidates']:
+        # If blocked by safety despite settings, or prompt was malformed
+        prompt_feedback = res_json.get('promptFeedback', {})
+        return f"⚠️ Moose couldn't parse an answer. Prompt feedback: {prompt_feedback.get('blockReason', 'Unknown block reason')}"
+
+    return res_json['candidates'][0]['content']['parts'][0]['text']
 
 def trigger_slack_alert(new_comment, count, player_code):
     message = (
@@ -219,7 +237,6 @@ def trigger_slack_alert(new_comment, count, player_code):
         json={'channel': SLACK_ALERT_CHANNEL, 'text': message},
         timeout=10
     )
-
 
 def post_slack_reply(channel, thread_ts, text):
     requests.post(
