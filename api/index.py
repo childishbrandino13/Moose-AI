@@ -2,42 +2,44 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import re
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
+from upstash_vector import Index # Run: pip install upstash-vector
 
 app = Flask(__name__)
 
-# ── Config from environment variables (set in Vercel dashboard) ──
-SLACK_BOT_TOKEN  = os.environ.get('SLACK_BOT_TOKEN')
-GEMINI_API_KEY   = os.environ.get('GEMINI_API_KEY')
-GEMINI_MODEL     = os.environ.get('GEMINI_MODEL', 'gemini-flash-latest')
-MOOSE_NAME       = os.environ.get('MOOSE_NAME', 'Moose')
-MOOSE_ICON_URL   = os.environ.get('MOOSE_ICON_URL', '')
-LOOKBACK_DAYS    = int(os.environ.get('LOOKBACK_DAYS', '90'))
-CACHE_SECRET     = os.environ.get('CACHE_SECRET')        # shared secret between Apps Script and Vercel
+# ── Config from environment variables ──
+SLACK_BOT_TOKEN    = os.environ.get('SLACK_BOT_TOKEN')
+GEMINI_API_KEY     = os.environ.get('GEMINI_API_KEY')
+GEMINI_MODEL       = os.environ.get('GEMINI_MODEL', 'gemini-1.5-flash')
+SLACK_ALERT_CHANNEL= os.environ.get('SLACK_ALERT_CHANNEL', 'C0B8581VDU')
+CACHE_SECRET       = os.environ.get('CACHE_SECRET')
+ALERT_THRESHOLD    = int(os.environ.get('ALERT_THRESHOLD', '3'))
 
-# Vercel KV (auto-populated when you add a KV store in Vercel dashboard)
-KV_REST_API_URL   = os.environ.get('KV_REST_API_URL')
-KV_REST_API_TOKEN = os.environ.get('KV_REST_API_TOKEN')
-KV_KEY            = 'moose_comments'
+# Upstash Vector Configuration
+VECTOR_URL         = os.environ.get('UPSTASH_VECTOR_REST_URL')
+VECTOR_TOKEN       = os.environ.get('UPSTASH_VECTOR_REST_TOKEN')
+vector_index       = Index(url=VECTOR_URL, token=VECTOR_TOKEN)
 
+# ── Helper: Generate Gemini Embeddings ────────────────────────
+def get_embedding(text):
+    """Generates numerical vectors for semantic search using text-embedding-004."""
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent'
+    body = {
+        "model": "models/text-embedding-004",
+        "content": {"parts": [{"text": text}]}
+    }
+    res = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=15)
+    return res.json()['embedding']['values']
 
 # ── Routes ────────────────────────────────────────────────────
-
-@app.route('/', methods=['GET'])
-def health():
-    return jsonify({'status': 'Moose is alive 🐾'})
-
 
 @app.route('/', methods=['POST'])
 def slack_handler():
     payload = request.get_json(force=True, silent=True) or {}
 
-    # Slack URL verification
     if payload.get('type') == 'url_verification':
         return jsonify({'challenge': payload.get('challenge')})
 
-    # Ignore retries (Slack retries if we're slow — avoid duplicate replies)
     if request.headers.get('X-Slack-Retry-Num'):
         return jsonify({'ok': True})
 
@@ -52,172 +54,135 @@ def slack_handler():
     question  = re.sub(r'<@[A-Z0-9]+>\s*', '', text).strip()
     channel   = event.get('channel')
     thread_ts = event.get('thread_ts') or event.get('ts')
-    is_reply  = event.get('thread_ts') and event.get('thread_ts') != event.get('ts')
 
-    # Load comments from KV cache (most recent 50 only for speed)
-    comments = kv_get()[:50]
+    # Get Question Embedding Vector
+    question_vector = get_embedding(question)
 
-    # Fetch thread history for context if this is a follow-up
-    thread_history = get_thread_history(channel, thread_ts) if is_reply else []
+    # Search Vector DB for top 25 contextually matching complaints
+    search_results = vector_index.query(
+        vector=question_vector,
+        top_k=25,
+        include_metadata=True
+    )
 
-    # Ask Gemini
-    answer = answer_question(question, comments, thread_history)
+    # Map database matches into a clean string context block for Gemini
+    comments = []
+    for res in search_results:
+        comments.append({
+            'date': res.metadata.get('date'),
+            'playerCode': res.metadata.get('playerCode'),
+            'comment': res.metadata.get('comment')
+        })
 
-    # Reply in Slack thread
+    # Ask Gemini based on targeted vector results
+    answer = answer_question(question, comments)
+
+    # Reply directly in the Slack thread
     post_slack_reply(channel, thread_ts, answer)
-
     return jsonify({'ok': True})
 
 
 @app.route('/cache', methods=['POST'])
 def cache_handler():
     """
-    Receives comment data pushed from Apps Script.
-    Protected by a shared secret token.
+    Receives single new comment row data pushed from Apps Script.
+    Analyzes theme clustering patterns via vector search.
     """
     auth = request.headers.get('X-Cache-Secret')
     if auth != CACHE_SECRET:
         return jsonify({'error': 'unauthorized'}), 401
 
     data = request.get_json(force=True, silent=True)
-    if not data or 'comments' not in data:
-        return jsonify({'error': 'missing comments'}), 400
+    if not data or 'comment' not in data:
+        return jsonify({'error': 'missing comment data'}), 400
 
-    kv_set(data['comments'])
-    return jsonify({'ok': True, 'count': len(data['comments'])})
+    comment_text = data['comment']
+    player_code  = data.get('playerCode', 'unknown')
+    comment_date = data.get('date', datetime.now().strftime('%b %d, %Y'))
 
+    # Generate vector embedding for incoming single comment
+    comment_vector = get_embedding(comment_text)
 
-# ── Vercel KV ─────────────────────────────────────────────────
-
-def kv_set(comments):
-    """Save comments array to KV store."""
-    value = json.dumps(comments)
-    requests.post(
-        f'{KV_REST_API_URL}/set/{KV_KEY}',
-        headers={
-            'Authorization': f'Bearer {KV_REST_API_TOKEN}',
-            'Content-Type':  'application/json',
-        },
-        data=value,
-        timeout=10,
+    # Query for structurally identical historical records (Threshold score 0.82)
+    matches = vector_index.query(
+        vector=comment_vector,
+        top_k=10,
+        include_metadata=True
     )
 
-
-def kv_get():
-    """Read comments array from KV store."""
-    res = requests.get(
-        f'{KV_REST_API_URL}/get/{KV_KEY}',
-        headers={'Authorization': f'Bearer {KV_REST_API_TOKEN}'},
-        timeout=10,
+    theme_matches = [m for m in matches if m.score >= 0.82]
+    
+    # Save new record to Upstash Vector Index
+    record_id = f"ticket_{datetime.now().timestamp()}"
+    vector_index.upsert(
+        vectors=[
+            (record_id, comment_vector, {
+                "comment": comment_text,
+                "playerCode": player_code,
+                "date": comment_date
+            })
+        ]
     )
-    data = res.json()
-    result = data.get('result')
-    if not result:
-        return []
-    try:
-        return json.loads(result)
-    except Exception:
-        return []
+
+    # If matching theme patterns cross the tracking threshold, flag it in Slack
+    if len(theme_matches) + 1 >= ALERT_THRESHOLD:
+        trigger_slack_alert(comment_text, len(theme_matches) + 1, player_code)
+
+    return jsonify({'ok': True, 'status': 'processed'})
 
 
-# ── Gemini ────────────────────────────────────────────────────
-
-def get_thread_history(channel, thread_ts):
-    """Fetch previous messages in a Slack thread for conversation context."""
-    res = requests.get(
-        'https://slack.com/api/conversations.replies',
-        headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
-        params={'channel': channel, 'ts': thread_ts, 'limit': 20},
-        timeout=10,
-    )
-    data = res.json()
-    messages = data.get('messages', [])
-    history = []
-    for msg in messages:
-        # Skip the bot_id check differently — include both user and bot messages
-        text = re.sub(r'<@[A-Z0-9]+>\s*', '', msg.get('text', '')).strip()
-        if not text:
-            continue
-        role = 'model' if msg.get('bot_id') else 'user'
-        history.append({'role': role, 'parts': [{'text': text}]})
-    return history
-
-
-def answer_question(question, comments, thread_history=None):
+def answer_question(question, comments):
     if comments:
         data_block = '\n'.join(
-            f"{i+1}. [{c.get('date','?')}] [Support Code: {c.get('playerCode') or c.get('player_code','?')}] {c.get('comment','')}"
+            f"{i+1}. [{c['date']}] [Support Code: {c['playerCode']}] {c['comment']}"
             for i, c in enumerate(comments)
         )
     else:
-        data_block = f'(No negative feedback found in the last {LOOKBACK_DAYS} days)'
+        data_block = '(No relevant historical customer complaints found in database matches)'
 
-    prompt = f"""You are a CS intelligence assistant for a mobile game team. Answer questions about negative player feedback directly and thoroughly.
+    prompt = f"""You are a CS intelligence assistant for a mobile sweeps app game team. Answer questions about negative player feedback directly and thoroughly.
 
-Feedback data ({len(comments)} negative comments, last {LOOKBACK_DAYS} days):
-Each entry format: [date] [Support Code: unique player identifier used by CS team] comment
+Relevant historical context retrieved from database vector search:
 {data_block}
 
-Today: {datetime.now().strftime('%b %-d, %Y')}
-
+Today: {datetime.now().strftime('%b %d, %Y')}
 Question: "{question}"
 
 Format rules:
-- Start your answer immediately — no greetings, no "Moose here", no preamble
-- Use * for bold, _ for italic. Never use ** double asterisks
-- Bullet points must start with • not * or -
-- No numbered lists, no hashtags, no parentheses as labels
-- Always include: what the issue is, how many players, date range, and what players are saying
-- Only report what the data actually shows — do not infer, speculate, or extrapolate beyond what players explicitly wrote
-- If only 1 player reported something, say so clearly and do not imply it's a wider trend
-- Keep the total response under 800 characters
-- If there's no relevant data, say so in one sentence"""
+- Start your answer immediately — no greetings or preambles
+- Use * for bold, _ for italic.
+- Bullet points must start with •
+- Keep total response under 800 characters."""
 
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
-
-    # Build conversation: system prompt first, then thread history, then current question
-    contents = [{'role': 'user', 'parts': [{'text': prompt}]},
-                {'role': 'model', 'parts': [{'text': 'Understood. I will answer questions about this feedback data accurately and concisely.'}]}]
-
-    if thread_history:
-        # Append prior thread turns (skip the first system exchange)
-        contents.extend(thread_history[1:])  # skip the original question already in prompt
-
-    # Add current question as final user turn
-    contents.append({'role': 'user', 'parts': [{'text': question}]})
-
     body = {
-        'contents': contents,
-        'generationConfig': {'maxOutputTokens': 2048},
+        'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
+        'generationConfig': {'maxOutputTokens': 1024},
     }
-    res  = requests.post(
-        url, json=body,
-        headers={'X-goog-api-key': GEMINI_API_KEY},
-        timeout=55,
+    res = requests.post(url, json=body, headers={'X-goog-api-key': GEMINI_API_KEY}, timeout=45)
+    return res.json()['candidates'][0]['content']['parts'][0]['text']
+
+
+def trigger_slack_alert(new_comment, count, player_code):
+    message = (
+        f"⚠️ *Moose Alert* — A negative feedback pattern has hit the threshold!\n"
+        f"• *Current Volume:* {count} matching recent player issues identified.\n"
+        f"• *Latest Ticket Highlight:* _\"{new_comment}\"_\n"
+        f"• *Impacted Support Code Reference:* `{player_code}`\n\n"
+        f"_Ask me details inside a thread mention to see historical parallels._"
     )
-    data = res.json()
+    requests.post(
+        'https://slack.com/api/chat.postMessage',
+        headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+        json={'channel': SLACK_ALERT_CHANNEL, 'text': message},
+        timeout=10
+    )
 
-    if 'error' in data:
-        return f"Sorry, I hit an error: {data['error'].get('message', 'unknown')}"
-
-    return data['candidates'][0]['content']['parts'][0]['text']
-
-
-# ── Slack ─────────────────────────────────────────────────────
 
 def post_slack_reply(channel, thread_ts, text):
-    # Split into chunks of 3800 chars to stay under Slack's 4000 char limit
-    chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
-    for chunk in chunks:
-        requests.post(
-            'https://slack.com/api/chat.postMessage',
-            headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
-            json={
-                'channel':   channel,
-                'thread_ts': thread_ts,
-                'text':      chunk,
-                'username':  MOOSE_NAME,
-                'icon_url':  MOOSE_ICON_URL,
-            },
-            timeout=10,
-        )
+    requests.post(
+        'https://slack.com/api/chat.postMessage',
+        headers={'Authorization': f'Bearer {SLACK_BOT_TOKEN}'},
+        json={'channel': channel, 'thread_ts': thread_ts, 'text': text},
+        timeout=10
+    )
