@@ -125,17 +125,55 @@ def slack_handler():
         return jsonify({'ok': True})
 
     try:
-        # STEP 3: Handle the vector database query and get context data
+        # STEP 3: Handle the dual namespace vector database query and get context data
         question_vector = get_embedding(question, is_query=True)
-        search_results = vector_index.query(vector=question_vector, top_k=25, include_metadata=True)
+        combined_results = []
+        
+        # Pull matching context from Google Sheets namespace
+        try:
+            sheet_results = vector_index.query(
+                vector=question_vector, 
+                top_k=15, 
+                include_metadata=True,
+                namespace="google-sheets"
+            )
+            if sheet_results: # Ensure it's a valid list and not None
+                combined_results.extend(sheet_results)
+                
+        except Exception as e:
+            print(f"Sheets namespace query fallback: {e}")
+
+        # Pull matching context from Helpshift namespace
+        try:
+            helpshift_results = vector_index.query(
+                vector=question_vector, 
+                top_k=15, 
+                include_metadata=True,
+                namespace="helpshift"
+            )
+            if helpshift_results: # Ensure it's a valid list and not None
+                combined_results.extend(helpshift_results)
+                
+        except Exception as e:
+            print(f"Helpshift namespace query fallback: {e}")
+
+        # Sort globally by vector proximity score if we actually found results
+        if combined_results:
+            combined_results.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
+            final_matches = combined_results[:25]
+        else:
+            final_matches = []
 
         comments = []
-        for res in search_results:
-            comments.append({
-                'date': res.metadata.get('date'),
-                'playerCode': res.metadata.get('playerCode'),
-                'comment': res.metadata.get('comment')
-            })
+        for res in final_matches:
+            # Check if metadata exists on the result object
+            meta = getattr(res, 'metadata', None)
+            if meta:
+                comments.append({
+                    'date': meta.get('date', 'Unknown Date'),
+                    'playerCode': meta.get('playerCode', 'N/A'),
+                    'comment': meta.get('comment', '')
+                })
 
         # STEP 4: Call Gemini 2.5 Flash to synthesize the final answer
         answer = answer_question(question, comments)
@@ -154,54 +192,58 @@ def slack_handler():
 
     return jsonify({'ok': True})
 
-
 @app.route('/cache', methods=['POST'])
 def cache_handler():
-    """Receives newly tracked tickets to index patterns and handle alerts."""
-    global last_alert_time
-    
-    auth = request.headers.get('X-Cache-Secret')
-    if auth != CACHE_SECRET:
-        return jsonify({'error': 'unauthorized'}), 401
+    """Handles manual/webhook ingestion of comments into specific vector namespaces."""
+    incoming_secret = request.headers.get('X-Cache-Secret')
+    if not incoming_secret or incoming_secret != CACHE_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json(force=True, silent=True) or {}
-    if not data or 'comment' not in data:
-        return jsonify({'error': 'missing comment data'}), 400
-
-    if not check_gemini_rate_limit():
-        return jsonify({'error': 'Rate-limit buffer maxed out'}), 429
-
-    comment_text = data['comment']
-    player_code  = data.get('playerCode', 'unknown')
-    comment_date = data.get('date', datetime.now().strftime('%b %d, %Y'))
-
-    # Generate item vector
-    comment_vector = get_embedding(comment_text, is_query=False)
-
-    # Search for historical contextual matches
-    matches = vector_index.query(vector=comment_vector, top_k=10, include_metadata=True)
-    theme_matches = [m for m in matches if m.score >= 0.82] # 82%+ semantic pattern match
+    comment = data.get('comment')
+    player_code = data.get('playerCode')
+    date_str = data.get('date')
     
-    # Save standard record entry directly inside Upstash Vector
-    record_id = f"ticket_{datetime.now().timestamp()}"
-    vector_index.upsert(
-        vectors=[(record_id, comment_vector, {
-            "comment": comment_text,
-            "playerCode": player_code,
-            "date": comment_date
-        })]
-    )
+    # Extract incoming timestamp and tags array, providing robust defaults
+    timestamp = data.get('timestamp', int(time.time()))
+    tags = data.get('tags', ["spreadsheet"])
 
-    # Evaluate dynamic threshold logic paired with spam cooldown protections
-    now = time.time()
-    if len(theme_matches) + 1 >= ALERT_THRESHOLD:
-        if now - last_alert_time > ALERT_COOLDOWN_WINDOW:
-            trigger_slack_alert(comment_text, len(theme_matches) + 1, player_code)
-            last_alert_time = now
-        else:
-            print("ℹ️ Theme pattern threshold crossed, but system is inside alert spam cooldown window.")
+    if not comment:
+        return jsonify({'error': 'Missing comment parameter'}), 400
 
-    return jsonify({'ok': True, 'status': 'processed'})
+    # Dynamically detect which namespace to drop this record into. Defaults to 'google-sheets'
+    target_namespace = request.args.get('namespace', 'google-sheets')
+
+    try:
+        # Generate the numerical semantic vector map
+        comment_vector = get_embedding(comment, is_query=False)
+        
+        # Formulate a unique vector ID footprint
+        record_id = f"row_{player_code}_{int(time.time())}"
+
+        # Push securely to Upstash using the targeted isolated namespace parameter
+        vector_index.upsert(
+            vectors=[
+                (
+                    record_id, 
+                    comment_vector, 
+                    {
+                        "comment": comment, 
+                        "playerCode": player_code, 
+                        "date": date_str,
+                        "timestamp": timestamp, # For future chronological boundaries
+                        "tags": tags            # For exact frequency filtering calculations
+                    }
+                )
+            ],
+            namespace=target_namespace 
+        )
+
+        return jsonify({'status': 'success', 'id': record_id, 'namespace': target_namespace}), 200
+
+    except Exception as e:
+        print(f"Ingestion Failure Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 # ── Synthesis & Output Format Engines ─────────────────────────
 
