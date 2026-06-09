@@ -245,6 +245,78 @@ def cache_handler():
         print(f"Ingestion Failure Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/helpshift-webhook', methods=['POST'])
+def helpshift_webhook_handler():
+    """
+    Listens for live real-time webhook payload streams from Helpshift 
+    when specific tags are applied to customer support tickets.
+    """
+    incoming_secret = request.args.get('secret')
+    if incoming_secret != CACHE_SECRET:
+        return jsonify({'error': 'Unauthorized Webhook Access'}), 401
+
+    payload = request.get_json(force=True, silent=True) or {}
+    
+    # Extract the event type and tissue details from the Helpshift payload structure
+    issue_data = payload.get('issue', {})
+    if not issue_data:
+        # If it's a test/ping webhook request from the Helpshift admin console
+        return jsonify({'status': 'ping received successfully'}), 200
+
+    # 1. Extract the core data elements we need for Moose's context memory
+    # Helpshift typically sends text in 'body' or 'description' depending on the webhook trigger type
+    comment = issue_data.get('body') or issue_data.get('description') or issue_data.get('title', '')
+    issue_id = issue_data.get('id', f"hs_unknown_{int(time.time())}")
+    
+    # Pull the player identifier 
+    custom_fields = issue_data.get('custom_fields', {})
+    player_code = custom_fields.get('player_id', {}).get('value') or issue_data.get('user_id', 'unknown_player')
+    
+    # Extract tags array to ensure we capture the specific tracking labels
+    hs_tags = issue_data.get('tags', [])
+    
+    # 2. Formulate uniform metadata properties matching our Google Sheet schema
+    created_at = issue_data.get('created_at', int(time.time()))
+    if isinstance(created_at, str):
+        # Fallback handling to format string dates nicely for Gemini to read
+        date_str = created_at[:10] 
+        timestamp = int(time.time())
+    else:
+        date_str = datetime.fromtimestamp(int(created_at)/1000).strftime('%b %d, %Y') if created_at > 100000000000 else datetime.fromtimestamp(int(created_at)).strftime('%b %d, %Y')
+        timestamp = int(created_at)/1000 if created_at > 100000000000 else int(created_at)
+
+    if not comment:
+        return jsonify({'status': 'ignored', 'reason': 'Empty message body content'}), 200
+
+    try:
+        # 3. Vectorize the support text using our standard 768-dimension clipping config
+        comment_vector = get_embedding(comment, is_query=False)
+        record_id = f"hs_{issue_id}"
+
+        # 4. Upsert directly into the isolated 'helpshift' namespace room
+        vector_index.upsert(
+            vectors=[
+                (
+                    record_id, 
+                    comment_vector, 
+                    {
+                        "comment": comment, 
+                        "playerCode": str(player_code), 
+                        "date": date_str,
+                        "timestamp": int(timestamp),
+                        "tags": hs_tags if hs_tags else ["helpshift"] # Keeps actual helpshift tags for precise math counting!
+                    }
+                )
+            ],
+            namespace="helpshift" # <-- Direct isolation segregation routing target
+        )
+
+        return jsonify({'status': 'success', 'id': record_id, 'namespace': 'helpshift'}), 200
+
+    except Exception as e:
+        print(f"Helpshift Ingestion Webhook Failure: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 # ── Synthesis & Output Format Engines ─────────────────────────
 
 def answer_question(question, comments):
